@@ -9,7 +9,7 @@ from torch.distributions import Normal,Categorical
 
 from copy import deepcopy
 import numpy as np
-from Buffer import Buffer_for_PPO
+from Buffer import Buffer_for_PPO_2
 
 import gymnasium as gym
 import argparse
@@ -41,6 +41,18 @@ critic_loss =  (V - V_target) ** 2
 这里使用第2种
 '''
 
+'''  
+改成github上常见的ppo形式，
+1.loss 同时更新actor和critic的参数
+2.同时存储采样时的价值估计 替代掉在train中计算的价值估计
+3.特别注意对最后一个value的处理：见stable_baselines3/common/buffers.py中RolloutBuffer类的compute_returns_and_advantage方法
+
+4.advantage 、 values 、returns 有两种情况（这里是第一种）
+1.使用GAE则 adv已知（根据GAE公式求），v_target = adv + v_s 这里v_target 也可以说是returns
+2.不使用GAE则 returns已知（折扣累计回报G_t = r_t + gamma *r_(t+1)）adv = returns - v_s
+
+
+'''
 
 ## 第一部分：定义Agent类
 '''actor部分 与sac的相同和区别
@@ -114,6 +126,9 @@ class Agent:
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        
+        # self.ac_parameters = list(self.actor.parameters()) + list(self.critic.parameters())
+        # self.ac_optimizer = torch.optim.Adam(self.ac_parameters, lr= actor_lr)
 
     def update_actor(self, loss):
         self.actor_optimizer.zero_grad()
@@ -127,13 +142,19 @@ class Agent:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimizer.step()
 
+    # def update_ac(self, loss):
+    #     self.ac_optimizer.zero_grad()
+    #     loss.backward()
+    #     torch.nn.utils.clip_grad_norm_(self.ac_parameters, 10)
+    #     self.ac_optimizer.step()
+
 ## 第二部分：定义DQN算法类
 class PPO:
     def __init__(self, dim_info, is_continue, actor_lr, critic_lr, horizon, device, trick = None):
 
         obs_dim, action_dim = dim_info
         self.agent = Agent(obs_dim, action_dim,  actor_lr, critic_lr, is_continue, device)
-        self.buffer = Buffer_for_PPO(horizon, obs_dim, act_dim = action_dim if is_continue else 1, device = device,) #Buffer中说明了act_dim和action_dim的区别
+        self.buffer = Buffer_for_PPO_2(horizon, obs_dim, act_dim = action_dim if is_continue else 1, device = device,) #Buffer中说明了act_dim和action_dim的区别
         self.device = device
         self.is_continue = is_continue
         print('actor_type:continue') if self.is_continue else print('actor_type:discrete')
@@ -143,6 +164,7 @@ class PPO:
 
     def select_action(self, obs):
         obs = torch.as_tensor(obs,dtype=torch.float32).reshape(1, -1).to(self.device) # 1xobs_dim
+        value = self.agent.critic(obs) # 1x1
         if self.is_continue: # dqn 无此项
             mean, std = self.agent.actor(obs)
             dist = Normal(mean, std)
@@ -155,7 +177,9 @@ class PPO:
         # to 真实值
         action = action.detach().cpu().numpy().squeeze(0) # 1xaction_dim ->action_dim
         action_log_pi = action_log_pi.detach().cpu().numpy().squeeze(0) # 1xaction_dim ->action_dim
-        return action , action_log_pi
+        value = value.detach().cpu().numpy().squeeze(0) # 1x1 -> scalar
+
+        return action , action_log_pi , value 
     
     def evaluate_action(self, obs):
         obs = torch.as_tensor(obs,dtype=torch.float32).reshape(1, -1).to(self.device)
@@ -175,8 +199,8 @@ class PPO:
     通常ppo的buffer中存储的是obs, action, reward, next_obs, done, log_pi ;
     比较1.不存储log_pi,而是在更新时计算出log_pi_old, 2.存储log_pi，将此作为log_pi_old 发现2更好 采用2
     '''
-    def add(self, obs, action, reward, next_obs, done, action_log_pi , adv_dones):
-        self.buffer.add(obs, action, reward, next_obs, done, action_log_pi , adv_dones)
+    def add(self, obs, action, reward, next_obs, terminated, action_log_pi , dones , value):
+        self.buffer.add(obs, action, reward, next_obs, terminated, action_log_pi , dones,value)
     
     ## ppo 无 buffer_sample  
 
@@ -186,29 +210,38 @@ class PPO:
     先更新critic会造成额外的偏差，所以PPO这里 先更新actor，再更新critic ,且PPO主要是策略更新的方法
     lmbda = 0 时 GAE 为 one-step TD ; lmbda = 1时，GAE 为 MC
     '''
-    def learn(self, minibatch_size, gamma, lmbda ,clip_param, K_epochs, entropy_coefficient):
+    def learn(self, minibatch_size, gamma, lmbda ,clip_param, K_epochs, entropy_coefficient,last_value):
+        self.buffer.compute_returns_and_advantage(gamma, lmbda, last_value)  # 计算GAE和v_target
+        
         '''
-        done : dead or win
-        adv_done : dead or win or reach max step
+        done : dead or win (terminated)
+        adv_done : dead or win or reach max step (dones)
         gae 公式：A_t = delta_t + gamma * lmbda * A_t+1 * (1 - adv_done) 
         '''
-        obs, action, reward, next_obs, done , action_log_pi , adv_dones = self.buffer.all()
+        obs, action, reward, next_obs, terminated , action_log_pi , dones , values = self.buffer.all()
+        
+        adv = torch.as_tensor(self.buffer.advantages,dtype=torch.float32).reshape(-1, 1).to(self.device)  # shape(horizon,1)
+        v_target =  torch.as_tensor(self.buffer.returns,dtype=torch.float32).reshape(-1, 1).to(self.device) # shape(horizon,1)
+        
+        '''
         # 计算GAE
         with torch.no_grad():  # adv and v_target have no gradient
             adv = np.zeros(self.horizon)
             gae = 0
             vs = self.agent.critic(obs)
             vs_ = self.agent.critic(next_obs)
-            td_delta = reward + gamma * (1.0 - done) * vs_ - vs
+            td_delta = reward + gamma * (1.0 - terminated) * vs_ - vs
             td_delta = td_delta.reshape(-1).cpu().detach().numpy()
-            adv_dones = adv_dones.reshape(-1).cpu().detach().numpy()
+            dones = dones.reshape(-1).cpu().detach().numpy()
             for i in reversed(range(self.horizon)):
-                gae = td_delta[i] + gamma * lmbda * gae * (1.0 - adv_dones[i])
+                gae = td_delta[i] + gamma * lmbda * gae * (1.0 - dones[i])
                 adv[i] = gae
             adv = torch.as_tensor(adv,dtype=torch.float32).reshape(-1, 1).to(self.device) ## cuda
             v_target = adv + vs  
             # if self.trick['adv_norm']:  # Trick :advantage normalization
             #     adv = ((adv - adv.mean()) / (adv.std() + 1e-5)) 
+        '''
+
         '''
         ## 计算log_pi_old 比较1
         mean , std = self.agent.actor(obs)
@@ -252,6 +285,7 @@ class PPO:
                 v_s = self.agent.critic(obs[index])
                 critic_loss = F.mse_loss(v_target[index], v_s)
                 self.agent.update_critic(critic_loss)
+                #self.agent.update_ac(actor_loss + critic_loss)  # 同时更新actor和critic
         
         ## 清空buffer
         self.buffer.clear()
@@ -270,7 +304,7 @@ class PPO:
 ## 第三部分：main函数   
 ''' 这里不用离散转连续域技巧'''
 def get_env(env_name,is_dis_to_con = False):
-    env = gym.make(env_name,continuous=True)  # 如需要使用LunarLander-v2的连续环境，这里需要加上continuous=True
+    env = gym.make(env_name)
     if isinstance(env.observation_space, gym.spaces.Box):
         obs_dim = env.observation_space.shape[0]
     else:
@@ -317,6 +351,42 @@ def make_dir(env_name,policy_name = 'DQN',trick = None):
     os.makedirs(model_dir)
     return model_dir
 
+## 熵衰减
+
+def linear_decay(current_step: int, total_steps: int, start_value: float, end_value: float) -> float:
+    """
+    计算线性衰减后的值。
+    
+    :param current_step: 当前的训练步数。
+    :param total_steps: 总的训练步数。
+    :param start_value: 初始值。
+    :param end_value: 最终值。
+    :return: 当前步数对应的衰减值。
+    """
+    if current_step >= total_steps:
+        return end_value
+    fraction = current_step / total_steps
+    return start_value - (start_value - end_value) * fraction
+
+import math
+
+def cosine_decay(current_step: int, total_steps: int, start_value: float, end_value: float) -> float:
+    """
+    计算余弦衰减后的值。
+    
+    :param current_step: 当前的训练步数。
+    :param total_steps: 总的训练步数。
+    :param start_value: 初始值。
+    :param end_value: 最终值。
+    :return: 当前步数对应的衰减值。
+    """
+    if current_step >= total_steps:
+        return end_value
+    fraction = current_step / total_steps
+    # 使用余弦函数 (cos(x*pi) + 1) / 2 将值从 1 平滑地衰减到 0
+    cosine_value = (math.cos(fraction * math.pi) + 1.0) / 2.0
+    return end_value + (start_value - end_value) * cosine_value
+
 ''' 
 环境见：
 离散: CartPole-v1,MountainCar-v0,;LunarLander-v2,;FrozenLake-v1 
@@ -327,10 +397,10 @@ reward_threshold：https://github.com/openai/gym/blob/master/gym/envs/__init__.p
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # 环境参数
-    parser.add_argument("--env_name", type = str,default="LunarLander-v2") 
+    parser.add_argument("--env_name", type = str,default="BipedalWalker-v3") 
     # 共有参数
     parser.add_argument("--seed", type=int, default=100) # 0 10 100
-    parser.add_argument("--max_episodes", type=int, default=int(500))
+    parser.add_argument("--max_episodes", type=int, default=int(1000))
     parser.add_argument("--save_freq", type=int, default=int(500//4))
     parser.add_argument("--start_steps", type=int, default=0) #ppo无此参数
     parser.add_argument("--random_steps", type=int, default=0)  #dqn 无此参数
@@ -340,18 +410,18 @@ if __name__ == '__main__':
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.01)
     ## A-C参数
-    parser.add_argument("--actor_lr", type=float, default=1e-3)
-    parser.add_argument("--critic_lr", type=float, default=1e-3)
+    parser.add_argument("--actor_lr", type=float, default=1e-4)
+    parser.add_argument("--critic_lr", type=float, default=1e-4)
     # PPO独有参数
     parser.add_argument("--horizon", type=int, default=2048) #根据环境更改：max_episodes数量级在百单位时horizon = 2048 minibatch_size = 64 小于百单位时，horizon = 128  minibatch_size = 32
     parser.add_argument("--clip_param", type=float, default=0.2) 
     parser.add_argument("--K_epochs", type=int, default=10)
-    parser.add_argument("--entropy_coefficient", type=float, default=0.01)
+    parser.add_argument("--entropy_coefficient", type=float, default=0.005)
     parser.add_argument("--minibatch_size", type=int, default=64)
     parser.add_argument("--lmbda", type=float, default=0.95) # GAE参数
     # trick参数
-    parser.add_argument("--policy_name", type=str, default='PPO')
-    parser.add_argument("--trick", type=dict, default={'adv_norm':False,}) 
+    parser.add_argument("--policy_name", type=str, default='PPO_2')
+    parser.add_argument("--trick", type=dict, default={'adv_norm':False,'entropy_coefficient_decay':False}) # adv_norm:是否对adv进行归一化 entropy_coefficient_decay:是否对熵系数进行衰减
 
     # device参数
     parser.add_argument("--device", type=str, default='cpu') # cpu/cuda
@@ -400,16 +470,22 @@ if __name__ == '__main__':
         step +=1
 
         # 获取动作
-        action , action_log_pi = policy.select_action(obs)   # action (-1,1)
+        action , action_log_pi , value = policy.select_action(obs)   # action (-1,1)
         if is_continue:
             action_ = np.clip(action * max_action , -max_action, max_action)
         else:
             action_ = action
         # 探索环境
-        next_obs, reward,terminated, truncated, infos = env.step(action_) 
+        next_obs, reward, terminated, truncated, infos = env.step(action_) 
         done = terminated or truncated
-        done_bool = terminated     ### truncated 为超过最大步数
-        policy.add(obs, action, reward, next_obs, done_bool, action_log_pi,done)
+
+        # 见：https://github.com/DLR-RM/stable-baselines3/blob/master/stable_baselines3/common/on_policy_algorithm.py#L236
+        if  truncated  and next_obs is not None: # 处理truncated
+            with torch.no_grad():
+                _ , _ , terminal_value = policy.select_action(next_obs)
+            reward += terminal_value.item() * args.gamma # 这里的value是对下一个状态的价值估计
+
+        policy.add(obs, action, reward, next_obs, terminated, action_log_pi, done ,value)
         episode_reward += reward
         obs = next_obs
         
@@ -427,7 +503,11 @@ if __name__ == '__main__':
         
         # 满足step,更新网络
         if step % args.horizon == 0:
-            policy.learn(args.minibatch_size, args.gamma, args.lmbda, args.clip_param, args.K_epochs, args.entropy_coefficient)
+            # 熵系数衰减
+            entropy_coefficient = cosine_decay(episode_num, args.max_episodes, args.entropy_coefficient, 0.001) if args.trick['entropy_coefficient_decay'] else args.entropy_coefficient
+            print(entropy_coefficient)
+            _ , _ , value = policy.select_action(next_obs)
+            policy.learn(args.minibatch_size, args.gamma, args.lmbda, args.clip_param, args.K_epochs, entropy_coefficient,last_value = value)
         
         # 保存模型
         if episode_num % args.save_freq == 0:

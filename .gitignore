@@ -14,4 +14,8 @@ test copy.py
 /MAPPO_file/__pycache__
 /ENVELOPE_MORL_file/__pycache__
 /REINFORCE_file/__pycache__
-/PPO_advance
+
+/PPO_advance/results
+/PPO_advance/__pycache__
+
+#/PPO_advance/

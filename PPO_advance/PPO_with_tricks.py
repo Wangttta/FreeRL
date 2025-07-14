@@ -14,6 +14,10 @@ from Buffer import Buffer_for_PPO
 import gymnasium as gym
 import argparse
 
+## tricks
+from normalization import Normalization,Normalization_batch_size,RewardScaling
+from torch.distributions import Beta
+
 ## 其他
 import re
 import time
@@ -25,11 +29,7 @@ from torch.utils.tensorboard import SummaryWriter
 2.DQN算法类:包括select_action,learn、test、save、load等方法,为具体的算法细节实现
 3.main函数:实例化DQN类,主要参数的设置,训练、测试、保存模型等
 '''
-'''PPO论文链接:https://arxiv.org/pdf/1707.06347
-1.提出了a novel objective with clipped probability ratios (新的目标，使用截断概率比)，形成对策略性能的悲观估计。
-2.在continuous 任务中，优于A2C,A2C+Trust Region,CEM,Vanilla PG +adaptive,TRPO
-3.在Atari中,样本效率优于A2C(Advantage Actor-Critic),与ACER(Actor-Critic with Experience Replay)相似,但PPO实现更简单。
-'''
+'''PPO论文链接:https://arxiv.org/pdf/1707.06347'''
 
 '''PPO论文中提到，
 1.如果使用AC网路共享参数，则
@@ -40,7 +40,22 @@ actor_loss = - surrogate_objective - entropy_coefficient * entropy_loss
 critic_loss =  (V - V_target) ** 2
 这里使用第2种
 '''
+########## tricks ###############
+'''tricks (本身算法已自带entropy_coef,由于grad_clip可以减少梯度消失的发生,算法默认加上)
+1.adv_norm :提升PG算法性能
+2.ObsNorm or Batch_ObsNorm ：统一到一个规模,利于训练
+3.reward_norm or reward_scaling :调整reward的尺度，避免因过大或过小的reward对价值函数的训练产生负面影响 后者 --《PPO-Implementation matters in deep policy gradients A case study on PPO and TRPO》
+4.lr_decay :一定程度增强训练后期的平稳性
+5.orthogonal_init ：防止在训练开始时出现梯度消失、梯度爆炸等问题
+6.adam_eps : 提高数值稳定性
+7.tanh :对于性能有一定提升 --《PPO-Implementation matters in deep policy gradients A case study on PPO and TRPO》
+附加:
+Actor_Beta分布
 
+参考:
+1.https://zhuanlan.zhihu.com/p/512327050?utm_psn=1766822721810653184 # 已包含此10个
+2.https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/
+'''
 
 ## 第一部分：定义Agent类
 '''actor部分 与sac的相同和区别
@@ -53,8 +68,16 @@ critic_loss =  (V - V_target) ** 2
 3.计算log_pi时 1.. sac的log_pi 是对tanh的对数概率，而ppo的log_pi是对动作的对数概率
         (重要) 2.. sac的log_pi 是直接对s_t得出的a_t计算的，而ppo的log_pi是对buffer中存储的s和a计算的(具体而言s->dist dist(a).log->log_pi)        
 '''
+def orthogonal_init(layer, gain=1.0):
+    '''
+    注：一般在初始化actor网络的输出层时，会把gain设置成0.01，actor网络的其他层和critic网络都使用Pytorch中正交初始化默认的gain=1.0。--tricks 参考1
+    把gain设置成0.01：这个方法类似于ddpg中的net_init的方法，意思是保持初始输出actor的动作接近于0。
+    '''
+    nn.init.orthogonal_(layer.weight, gain=gain) #gain意思是权重矩阵的缩放因子 默认为1
+    nn.init.constant_(layer.bias, 0)
+
 class Actor(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_1=128, hidden_2=128):
+    def __init__(self, obs_dim, action_dim, hidden_1=128, hidden_2=128,trick = None):
         super(Actor, self).__init__()
         self.l1 = nn.Linear(obs_dim, hidden_1)
         self.l2 = nn.Linear(hidden_1, hidden_2)
@@ -62,9 +85,17 @@ class Actor(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # 方法参考 1.https://github.com/zhangchuheng123/Reinforcement-Implementation/blob/master/code/ppo.py#L134C29-L134C41
                                                                       # 2.    https://github.com/Lizhi-sjtu/DRL-code-pytorch/blob/main/5.PPO-continuous/ppo_continuous.py#L56
                                                                       # 3.    https://github.com/openai/spinningup/blob/master/spinup/algos/pytorch/ppo/core.py#L85
+        self.trick = trick
+        if self.trick['orthogonal_init']:
+            orthogonal_init(self.l1)
+            orthogonal_init(self.l2)
+            orthogonal_init(self.mean_layer,gain=0.01)
+        
+        self.act_func = nn.Tanh() if self.trick['tanh'] else nn.ReLU()
+    
     def forward(self, obs ):
-        x = F.relu(self.l1(obs))
-        x = F.relu(self.l2(x))
+        x = self.act_func(self.l1(obs))
+        x = self.act_func(self.l2(x))
         mean = torch.tanh(self.mean_layer(x))  # 使得mean在-1,1之间
 
         log_std = self.log_std.expand_as(mean)  # 使得log_std与mean维度相同 输出log_std以确保std=exp(log_std)>0
@@ -72,7 +103,7 @@ class Actor(nn.Module):
         std = torch.exp(log_std)
 
         return mean, std
-
+    
 class Actor_discrete(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden_1=128, hidden_2=128):
         super(Actor_discrete, self).__init__()
@@ -85,35 +116,84 @@ class Actor_discrete(nn.Module):
         x = F.relu(self.l2(x))
         a_prob = torch.softmax(self.l3(x), dim=1)
         return a_prob
+
+class Actor_Beta(nn.Module):
+    def __init__(self, obs_dim, action_dim, hidden_1=128, hidden_2=128,trick = None):
+        super(Actor_Beta, self).__init__()
+        self.l1 = nn.Linear(obs_dim, hidden_1)
+        self.l2 = nn.Linear(hidden_1, hidden_2)
+        self.alpha_layer = nn.Linear(hidden_2, action_dim) #输出
+        self.beta_layer = nn.Linear(hidden_2, action_dim) 
+
+        self.trick = trick
+        if self.trick['orthogonal_init']:
+            orthogonal_init(self.l1)
+            orthogonal_init(self.l2)
+            orthogonal_init(self.alpha_layer,gain=0.01)
+            orthogonal_init(self.beta_layer,gain=0.01)
+        
+        self.act_func = nn.Tanh() if self.trick['tanh'] else nn.ReLU()
     
-'''   
+    def forward(self, x ):
+        x = self.act_func(self.l1(x))
+        x = self.act_func(self.l2(x))
+        # alpha and beta need to be larger than 1,so we use 'softplus' as the activation function and then plus 1
+        alpha = F.softplus(self.alpha_layer(x)) + 1.0
+        beta = F.softplus(self.beta_layer(x)) + 1.0
+        return alpha, beta 
+    
+    def mean(self, x):
+        '''公式 beta分布的mean = alpha/(alpha+beta)
+        mean输出范围:0-1
+        '''
+        alpha, beta = self.forward(x)
+        mean = alpha / (alpha + beta)  # The mean of the beta distribution
+        return mean 
+    
+'''
 critic部分 与sac区别
 区别:sac中critic输出Q1,Q2,而ppo中只输出V
 '''    
 class Critic(nn.Module):
-    def __init__(self, obs_dim, hidden_1=128, hidden_2=128):
+    def __init__(self, obs_dim, hidden_1=128, hidden_2=128,trick = None):
         super(Critic, self).__init__()
         self.l1 = nn.Linear(obs_dim, hidden_1)
         self.l2 = nn.Linear(hidden_1, hidden_2)
         self.l3 = nn.Linear(hidden_2, 1)
 
-    def forward(self, obs):
-        x = F.relu(self.l1(obs))
-        x = F.relu(self.l2(x))
+        self.trick = trick
+        if self.trick['orthogonal_init']:
+            orthogonal_init(self.l1)
+            orthogonal_init(self.l2)
+            orthogonal_init(self.l3)
+        
+        self.act_func = nn.Tanh() if self.trick['tanh'] else nn.ReLU()
+
+    def forward(self, x):
+        x = self.act_func(self.l1(x))
+        x = self.act_func(self.l2(x))
         value = self.l3(x)
+
         return value
     
 class Agent:
-    def __init__(self, obs_dim, action_dim, actor_lr, critic_lr, is_continue, device):
+    def __init__(self, obs_dim, action_dim, actor_lr, critic_lr, is_continue, device, trick, actor_dist):
         
         if is_continue:
-            self.actor = Actor(obs_dim, action_dim, ).to(device)
+            if actor_dist['Beta']:
+                self.actor = Actor_Beta(obs_dim, action_dim, trick=trick).to(device)
+            else:
+                self.actor = Actor(obs_dim, action_dim, trick=trick).to(device)
         else:
             self.actor = Actor_discrete(obs_dim, action_dim, ).to(device)
-        self.critic = Critic( obs_dim ).to(device)
-
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.critic = Critic( obs_dim,trick=trick ).to(device)
+        
+        if trick['adam_eps']:
+            self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr, eps=1e-5)
+            self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr, eps=1e-5)
+        else:
+            self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+            self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
 
     def update_actor(self, loss):
         self.actor_optimizer.zero_grad()
@@ -129,23 +209,40 @@ class Agent:
 
 ## 第二部分：定义DQN算法类
 class PPO:
-    def __init__(self, dim_info, is_continue, actor_lr, critic_lr, horizon, device, trick = None):
+    def __init__(self, dim_info, is_continue, actor_lr, critic_lr, horizon, device, trick = None,beta = False):
 
+        self.actor_dist = {'Beta':True if beta else False} # 默认actor拟合Gaussian函数
+        print('actor_dist:Beta') if self.actor_dist['Beta'] else print('actor_dist:Gaussian')
+        
         obs_dim, action_dim = dim_info
-        self.agent = Agent(obs_dim, action_dim,  actor_lr, critic_lr, is_continue, device)
-        self.buffer = Buffer_for_PPO(horizon, obs_dim, act_dim = action_dim if is_continue else 1, device = device,) #Buffer中说明了act_dim和action_dim的区别
+        self.agent = Agent(obs_dim, action_dim,  actor_lr, critic_lr, is_continue, device, trick, actor_dist=self.actor_dist)
+        self.buffer = Buffer_for_PPO(horizon, obs_dim, act_dim = action_dim if is_continue else 1, device = device) #Buffer中说明了act_dim和action_dim的区别
         self.device = device
         self.is_continue = is_continue
         print('actor_type:continue') if self.is_continue else print('actor_type:discrete')
 
         self.horizon = int(horizon)
+
         self.trick = trick
+        if self.trick['Batch_ObsNorm']:
+            self.batch_size_obs_norm = Normalization_batch_size(shape = obs_dim, device = device)
+        
+        if self.trick['lr_decay']:
+            self.actor_lr = actor_lr
+            self.critic_lr = critic_lr
 
     def select_action(self, obs):
         obs = torch.as_tensor(obs,dtype=torch.float32).reshape(1, -1).to(self.device) # 1xobs_dim
+        if self.trick['Batch_ObsNorm']:
+            obs = self.batch_size_obs_norm(obs,update=False)
+
         if self.is_continue: # dqn 无此项
-            mean, std = self.agent.actor(obs)
-            dist = Normal(mean, std)
+            if self.actor_dist['Beta']:
+                alpha, beta = self.agent.actor(obs)
+                dist = Beta(alpha, beta)
+            else:
+                mean, std = self.agent.actor(obs)
+                dist = Normal(mean, std)
             action = dist.sample()
             action_log_pi = dist.log_prob(action) # 1xaction_dim
         else:
@@ -160,7 +257,11 @@ class PPO:
     def evaluate_action(self, obs):
         obs = torch.as_tensor(obs,dtype=torch.float32).reshape(1, -1).to(self.device)
         if self.is_continue:
-            mean, _ = self.agent.actor(obs)
+            if self.actor_dist['Beta']:
+                mean = self.agent.actor.mean(obs)
+                mean = 2 * (mean - 0.5)  # [0,1] ->[-1,1]
+            else:
+                mean, _ = self.agent.actor(obs)
             action = mean.detach().cpu().numpy().squeeze(0)
         else:
             a_prob = self.agent.actor(obs).detach().cpu().numpy().squeeze(0) 
@@ -178,7 +279,7 @@ class PPO:
     def add(self, obs, action, reward, next_obs, done, action_log_pi , adv_dones):
         self.buffer.add(obs, action, reward, next_obs, done, action_log_pi , adv_dones)
     
-    ## ppo 无 buffer_sample  
+    ## ppo 无 buffer_sample
 
     ## PPO算法相关
     '''
@@ -193,9 +294,12 @@ class PPO:
         gae 公式：A_t = delta_t + gamma * lmbda * A_t+1 * (1 - adv_done) 
         '''
         obs, action, reward, next_obs, done , action_log_pi , adv_dones = self.buffer.all()
+        if self.trick['Batch_ObsNorm']:
+            obs = self.batch_size_obs_norm(obs)
+            next_obs = self.batch_size_obs_norm(next_obs,update=False) #只对输入obs进行更新
         # 计算GAE
         with torch.no_grad():  # adv and v_target have no gradient
-            adv = np.zeros(self.horizon)
+            adv = np.zeros(self.horizon,dtype=torch.float32)
             gae = 0
             vs = self.agent.critic(obs)
             vs_ = self.agent.critic(next_obs)
@@ -207,16 +311,9 @@ class PPO:
                 adv[i] = gae
             adv = torch.as_tensor(adv,dtype=torch.float32).reshape(-1, 1).to(self.device) ## cuda
             v_target = adv + vs  
-            # if self.trick['adv_norm']:  # Trick :advantage normalization
-            #     adv = ((adv - adv.mean()) / (adv.std() + 1e-5)) 
-        '''
-        ## 计算log_pi_old 比较1
-        mean , std = self.agent.actor(obs)
-        dist = Normal(mean, std)
-        log_pi_old = dist.log_prob(action).sum(dim = 1 ,keepdim = True) 
-        action_log_pi = log_pi_old.detach() 
-        '''
-        
+            if self.trick['adv_norm']:  
+                adv = ((adv - adv.mean()) / (adv.std() + 1e-8)) 
+
         # Optimize policy for K epochs:
         for _ in range(K_epochs): 
             # 随机打乱样本 并 生成小批量
@@ -225,10 +322,14 @@ class PPO:
             for index in indexes:
                 # 先更新actor
                 if self.is_continue:
-                    mean, std = self.agent.actor(obs[index])
-                    dist_now = Normal(mean, std)
+                    if self.actor_dist['Beta']:
+                        alpha, beta = self.agent.actor(obs[index])
+                        dist_now = Beta(alpha, beta)
+                    else:
+                        mean, std = self.agent.actor(obs[index])
+                        dist_now = Normal(mean, std)
                     dist_entropy = dist_now.entropy().sum(dim = 1, keepdim=True)  # mini_batch_size x action_dim -> mini_batch_size x 1
-                    action_log_pi_now = dist_now.log_prob(action[index]) # mini_batch_size x action_dim 
+                    action_log_pi_now = dist_now.log_prob(action[index]) # mini_batch_size x 1
                 else:
                     dist_now = Categorical(probs=self.agent.actor(obs[index]))
                     dist_entropy = dist_now.entropy().reshape(-1,1) # mini_batch_size  -> mini_batch_size x 1
@@ -241,12 +342,8 @@ class PPO:
                 ratios = torch.exp(action_log_pi_now.sum(dim = 1, keepdim=True) - action_log_pi[index].sum(dim = 1, keepdim=True))  # shape(mini_batch_size X 1)
                 surr1 = ratios * adv[index]  
                 surr2 = torch.clamp(ratios, 1 - clip_param, 1 + clip_param) * adv[index]  
-                actor_loss = -torch.min(surr1, surr2).mean() - entropy_coefficient * dist_entropy.mean()
+                actor_loss = -torch.min(surr1, surr2).mean() - entropy_coefficient * dist_entropy.mean()  
                 self.agent.update_actor(actor_loss)
-                '''or  (mean -> 转换为标量)
-                actor_loss = -torch.min(surr1, surr2) - entropy_coefficient * dist_entropy
-                self.agent.update_actor(actor_loss.mean())
-                '''
 
                 # 再更新critic
                 v_s = self.agent.critic(obs[index])
@@ -255,6 +352,15 @@ class PPO:
         
         ## 清空buffer
         self.buffer.clear()
+
+    
+    def lr_decay(self, episode_num,max_episodes):
+        lr_a_now = self.actor_lr * (1 - episode_num / max_episodes)
+        lr_c_now = self.critic_lr * (1 - episode_num / max_episodes)
+        for p in self.agent.actor_optimizer.param_groups:
+            p['lr'] = lr_a_now
+        for p in self.agent.critic_optimizer.param_groups:
+            p['lr'] = lr_c_now
     
     ## 保存模型
     def save(self, model_dir):
@@ -262,15 +368,15 @@ class PPO:
     
     ## 加载模型
     @staticmethod 
-    def load(dim_info, is_continue ,model_dir,trick=None):
-        policy = PPO(dim_info,is_continue,0,0,0,device = torch.device("cpu"), trick = trick)
+    def load(dim_info, is_continue ,model_dir,trick,beta):
+        policy = PPO(dim_info,is_continue,0,0,0,device = torch.device("cpu"),trick=trick,beta = beta)
         policy.agent.actor.load_state_dict(torch.load(os.path.join(model_dir,"PPO.pt")))
         return policy
 
 ## 第三部分：main函数   
 ''' 这里不用离散转连续域技巧'''
 def get_env(env_name,is_dis_to_con = False):
-    env = gym.make(env_name,continuous=True)  # 如需要使用LunarLander-v2的连续环境，这里需要加上continuous=True
+    env = gym.make(env_name)
     if isinstance(env.observation_space, gym.spaces.Box):
         obs_dim = env.observation_space.shape[0]
     else:
@@ -309,17 +415,19 @@ def make_dir(env_name,policy_name = 'DQN',trick = None):
         for key in trick.keys():
             if trick[key]:
                 prefix += key + '_'
+
     # 查找现有的文件夹并确定下一个编号
     pattern = re.compile(f'^{prefix}\d+') # ^ 表示开头，\d 表示数字，+表示至少一个
     existing_dirs = [d for d in os.listdir(env_dir) if pattern.match(d)]
+    print('existing_dirs:',existing_dirs)
     max_number = 0 if not existing_dirs else max([int(d.split('_')[-1]) for d in existing_dirs if d.split('_')[-1].isdigit()])
     model_dir = os.path.join(env_dir, prefix + str(max_number + 1))
     os.makedirs(model_dir)
     return model_dir
-
+    
 ''' 
 环境见：
-离散: CartPole-v1,MountainCar-v0,;LunarLander-v2,;FrozenLake-v1 
+离散:CartPole-v1,MountainCar-v0,;LunarLander-v2,;FrozenLake-v1 
 连续：Pendulum-v1,MountainCarContinuous-v0,BipedalWalker-v3
 reward_threshold：https://github.com/openai/gym/blob/master/gym/envs/__init__.py 
 介绍：https://gymnasium.farama.org/
@@ -327,9 +435,9 @@ reward_threshold：https://github.com/openai/gym/blob/master/gym/envs/__init__.p
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # 环境参数
-    parser.add_argument("--env_name", type = str,default="LunarLander-v2") 
+    parser.add_argument("--env_name", type = str,default="CartPole-v1") 
     # 共有参数
-    parser.add_argument("--seed", type=int, default=100) # 0 10 100
+    parser.add_argument("--seed", type=int, default=0) # 0 10 100
     parser.add_argument("--max_episodes", type=int, default=int(500))
     parser.add_argument("--save_freq", type=int, default=int(500//4))
     parser.add_argument("--start_steps", type=int, default=0) #ppo无此参数
@@ -343,26 +451,35 @@ if __name__ == '__main__':
     parser.add_argument("--actor_lr", type=float, default=1e-3)
     parser.add_argument("--critic_lr", type=float, default=1e-3)
     # PPO独有参数
-    parser.add_argument("--horizon", type=int, default=2048) #根据环境更改：max_episodes数量级在百单位时horizon = 2048 minibatch_size = 64 小于百单位时，horizon = 128  minibatch_size = 32
-    parser.add_argument("--clip_param", type=float, default=0.2) 
+    parser.add_argument("--horizon", type=int, default=2048)
+    parser.add_argument("--clip_param", type=float, default=0.2)
     parser.add_argument("--K_epochs", type=int, default=10)
     parser.add_argument("--entropy_coefficient", type=float, default=0.01)
     parser.add_argument("--minibatch_size", type=int, default=64)
     parser.add_argument("--lmbda", type=float, default=0.95) # GAE参数
     # trick参数
     parser.add_argument("--policy_name", type=str, default='PPO')
-    parser.add_argument("--trick", type=dict, default={'adv_norm':False,}) 
-
+    parser.add_argument("--trick", type=dict, default={'adv_norm':False,
+                                                       'ObsNorm':False,'Batch_ObsNorm':False,  # or 两者择1
+                                                       'reward_norm':False, 'reward_scaling':False, # or 
+                                                       'lr_decay':False,'orthogonal_init':False,'adam_eps':False,'tanh':False})
+    parser.add_argument("--beta", type=bool, default=False)
     # device参数
     parser.add_argument("--device", type=str, default='cpu') # cpu/cuda
     args = parser.parse_args()
+    # 检查 reward_norm 和 reward_scaling 的值
+    if args.trick['reward_norm'] and args.trick['reward_scaling']:
+        raise ValueError("reward_norm 和 reward_scaling 不能同时为 True")
+    if args.trick['ObsNorm'] and args.trick['Batch_ObsNorm']:
+        raise ValueError("ObsNorm 和 Batch_ObsNorm 不能同时为 True")
+    
     print(args)
     print('-' * 50)
     print('Algorithm:',args.policy_name)
     
     ## 环境配置
     env,dim_info,max_action,is_continue = get_env(args.env_name,args.is_dis_to_con)
-    action_dim = dim_info[1]
+    obs_dim,action_dim = dim_info
     print(f'Env:{args.env_name}  obs_dim:{dim_info[0]}  action_dim:{dim_info[1]}  max_action:{max_action}  max_episodes:{args.max_episodes}')
 
     ## 随机数种子
@@ -383,7 +500,7 @@ if __name__ == '__main__':
     device = torch.device(args.device) if torch.cuda.is_available() else torch.device('cpu')
     
     ## 算法配置
-    policy = PPO(dim_info, is_continue, actor_lr = args.actor_lr, critic_lr = args.critic_lr, horizon = args.horizon, device = device)
+    policy = PPO(dim_info, is_continue, actor_lr = args.actor_lr, critic_lr = args.critic_lr, horizon = args.horizon, device = device,trick = args.trick,beta = args.beta)
 
     env_spec = gym.spec(args.env_name)
     print('reward_threshold:',env_spec.reward_threshold if env_spec.reward_threshold else 'No Threshold = Higher is better')
@@ -395,6 +512,14 @@ if __name__ == '__main__':
     train_return = []
     obs,info = env.reset(seed=args.seed)
     env.action_space.seed(seed=args.seed) if args.random_steps > 0 else None # 针对action复现:env.action_space.sample()
+    if args.trick['ObsNorm']:
+        obs_norm = Normalization(shape = obs_dim)
+        obs = obs_norm(obs)
+
+    if args.trick['reward_norm']:  
+        reward_norm = Normalization(shape=1)
+    elif args.trick['reward_scaling']:  
+        reward_scaling = RewardScaling(shape=1, gamma=args.gamma)
     
     while episode_num < args.max_episodes:
         step +=1
@@ -407,9 +532,18 @@ if __name__ == '__main__':
             action_ = action
         # 探索环境
         next_obs, reward,terminated, truncated, infos = env.step(action_) 
+        if args.trick['ObsNorm']:
+            next_obs = obs_norm(next_obs)
+        if args.trick['reward_norm']:  
+            reward_ = reward_norm(reward)
+        elif args.trick['reward_scaling']:
+            reward_ = reward_scaling(reward)
         done = terminated or truncated
         done_bool = terminated     ### truncated 为超过最大步数
-        policy.add(obs, action, reward, next_obs, done_bool, action_log_pi,done)
+        if args.trick['reward_norm'] or args.trick['reward_scaling']:
+            policy.add(obs, action, reward_, next_obs, done_bool, action_log_pi,done)
+        else:
+            policy.add(obs, action, reward, next_obs, done_bool, action_log_pi,done)
         episode_reward += reward
         obs = next_obs
         
@@ -423,11 +557,17 @@ if __name__ == '__main__':
 
             episode_num += 1
             obs,info = env.reset(seed=args.seed)
+            if args.trick['ObsNorm']:
+                obs = obs_norm(obs)
+            if args.trick['reward_scaling']:
+                reward_scaling.reset()
             episode_reward = 0
         
         # 满足step,更新网络
         if step % args.horizon == 0:
             policy.learn(args.minibatch_size, args.gamma, args.lmbda, args.clip_param, args.K_epochs, args.entropy_coefficient)
+            if args.trick['lr_decay']:
+                policy.lr_decay(episode_num,max_episodes=args.max_episodes)
         
         # 保存模型
         if episode_num % args.save_freq == 0:
@@ -438,3 +578,7 @@ if __name__ == '__main__':
     policy.save(model_dir)
     ## 保存数据
     np.save(os.path.join(model_dir,f"{args.policy_name}_seed_{args.seed}.npy"),np.array(train_return))
+    if args.trick['ObsNorm']:
+        np.save(os.path.join(model_dir,f"{args.policy_name}_running_mean_std.npy"),np.array([obs_norm.running_ms.mean,obs_norm.running_ms.std]))
+    if args.trick['Batch_ObsNorm']:
+        np.save(os.path.join(model_dir,f"{args.policy_name}_running_mean_std_batch_size.npy"),np.array([policy.batch_size_obs_norm.running_ms.mean.detach().cpu().numpy(),policy.batch_size_obs_norm.running_ms.std.detach().cpu().numpy()]))

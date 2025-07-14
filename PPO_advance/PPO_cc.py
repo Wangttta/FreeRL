@@ -41,6 +41,10 @@ critic_loss =  (V - V_target) ** 2
 这里使用第2种
 '''
 
+'''  
+这里尝试加入多进程的加速方法
+改成 cuda训练 cpu采样版
+'''
 
 ## 第一部分：定义Agent类
 '''actor部分 与sac的相同和区别
@@ -175,8 +179,8 @@ class PPO:
     通常ppo的buffer中存储的是obs, action, reward, next_obs, done, log_pi ;
     比较1.不存储log_pi,而是在更新时计算出log_pi_old, 2.存储log_pi，将此作为log_pi_old 发现2更好 采用2
     '''
-    def add(self, obs, action, reward, next_obs, done, action_log_pi , adv_dones):
-        self.buffer.add(obs, action, reward, next_obs, done, action_log_pi , adv_dones)
+    def add(self, obs, action, reward, next_obs, terminated, action_log_pi , dones):
+        self.buffer.add(obs, action, reward, next_obs, terminated, action_log_pi , dones)
     
     ## ppo 无 buffer_sample  
 
@@ -192,18 +196,18 @@ class PPO:
         adv_done : dead or win or reach max step
         gae 公式：A_t = delta_t + gamma * lmbda * A_t+1 * (1 - adv_done) 
         '''
-        obs, action, reward, next_obs, done , action_log_pi , adv_dones = self.buffer.all()
+        obs, action, reward, next_obs, terminated , action_log_pi , dones = self.buffer.all()
         # 计算GAE
         with torch.no_grad():  # adv and v_target have no gradient
             adv = np.zeros(self.horizon)
             gae = 0
             vs = self.agent.critic(obs)
             vs_ = self.agent.critic(next_obs)
-            td_delta = reward + gamma * (1.0 - done) * vs_ - vs
+            td_delta = reward + gamma * (1.0 - terminated) * vs_ - vs
             td_delta = td_delta.reshape(-1).cpu().detach().numpy()
-            adv_dones = adv_dones.reshape(-1).cpu().detach().numpy()
+            dones = dones.reshape(-1).cpu().detach().numpy()
             for i in reversed(range(self.horizon)):
-                gae = td_delta[i] + gamma * lmbda * gae * (1.0 - adv_dones[i])
+                gae = td_delta[i] + gamma * lmbda * gae * (1.0 - dones[i])
                 adv[i] = gae
             adv = torch.as_tensor(adv,dtype=torch.float32).reshape(-1, 1).to(self.device) ## cuda
             v_target = adv + vs  
@@ -270,7 +274,7 @@ class PPO:
 ## 第三部分：main函数   
 ''' 这里不用离散转连续域技巧'''
 def get_env(env_name,is_dis_to_con = False):
-    env = gym.make(env_name,continuous=True)  # 如需要使用LunarLander-v2的连续环境，这里需要加上continuous=True
+    env = gym.make(env_name)
     if isinstance(env.observation_space, gym.spaces.Box):
         obs_dim = env.observation_space.shape[0]
     else:
@@ -319,7 +323,7 @@ def make_dir(env_name,policy_name = 'DQN',trick = None):
 
 ''' 
 环境见：
-离散: CartPole-v1,MountainCar-v0,;LunarLander-v2,;FrozenLake-v1 
+离散: CartPole-v1,MountainCar-v0,;LunarLander-v3,;FrozenLake-v1 
 连续：Pendulum-v1,MountainCarContinuous-v0,BipedalWalker-v3
 reward_threshold：https://github.com/openai/gym/blob/master/gym/envs/__init__.py 
 介绍：https://gymnasium.farama.org/
@@ -327,7 +331,7 @@ reward_threshold：https://github.com/openai/gym/blob/master/gym/envs/__init__.p
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # 环境参数
-    parser.add_argument("--env_name", type = str,default="LunarLander-v2") 
+    parser.add_argument("--env_name", type = str,default="LunarLander-v3") 
     # 共有参数
     parser.add_argument("--seed", type=int, default=100) # 0 10 100
     parser.add_argument("--max_episodes", type=int, default=int(500))
@@ -350,7 +354,7 @@ if __name__ == '__main__':
     parser.add_argument("--minibatch_size", type=int, default=64)
     parser.add_argument("--lmbda", type=float, default=0.95) # GAE参数
     # trick参数
-    parser.add_argument("--policy_name", type=str, default='PPO')
+    parser.add_argument("--policy_name", type=str, default='PPO_advance')
     parser.add_argument("--trick", type=dict, default={'adv_norm':False,}) 
 
     # device参数
@@ -406,10 +410,9 @@ if __name__ == '__main__':
         else:
             action_ = action
         # 探索环境
-        next_obs, reward,terminated, truncated, infos = env.step(action_) 
+        next_obs, reward, terminated, truncated, infos = env.step(action_) 
         done = terminated or truncated
-        done_bool = terminated     ### truncated 为超过最大步数
-        policy.add(obs, action, reward, next_obs, done_bool, action_log_pi,done)
+        policy.add(obs, action, reward, next_obs, terminated, action_log_pi,done)
         episode_reward += reward
         obs = next_obs
         
